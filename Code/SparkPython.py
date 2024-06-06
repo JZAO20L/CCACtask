@@ -185,7 +185,7 @@ if __name__ == '__main__':
 
     # 清空内容
     with open(ouput_file_path,'w',encoding='utf-8') as ouput_file:
-            ouput_file.write('Result"\n')
+            ouput_file.write('Result:\n')
 
     i=0
     for item in json_objects:
