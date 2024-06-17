@@ -1,0 +1,262 @@
+import sys
+import torch
+from datasets import load_dataset, load_from_disk
+from transformers import BertModel
+from transformers import BertTokenizer
+from transformers import AdamW
+from sklearn.metrics import precision_score
+from sklearn.metrics import accuracy_score
+from sklearn.metrics import recall_score
+from sklearn.metrics import f1_score
+import time
+
+start_time = time.time()
+
+# print(torch.__version__)
+# 快速演示
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+print('device=', device)
+
+# config
+model_path = "./bert-base-chinese"
+epoch=50
+epoch_num_between_tests=5
+start1B1 = 20
+LR=5e-3
+WD=0.04
+DO=0.5
+
+
+
+# 加载预训练模型
+pretrained = BertModel.from_pretrained(model_path)
+
+# 设置不计算梯度
+for param in pretrained.parameters():
+    param.requires_grad = False
+
+
+# 定义下游任务模型
+class Model(torch.nn.Module):
+
+    # 线性层 此处定义深度学习网络结构
+    def __init__(self):
+        super().__init__()
+        # self.fc = torch.nn.Linear(768, 2)
+        # add dropout
+        self.bert = pretrained
+        self.fc = torch.nn.Sequential(
+            torch.nn.Dropout(DO),
+            # one layer 批归一化，数据为1d的所以用1d
+            torch.nn.BatchNorm1d(768),
+            torch.nn.LeakyReLU(inplace=True),
+            torch.nn.Linear(768, 2),
+            torch.nn.BatchNorm1d(2),
+            torch.nn.LeakyReLU(inplace=True)
+        )
+
+    def forward(self, input_ids, attention_mask, token_type_ids):
+        out = self.bert(input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        token_type_ids=token_type_ids)
+
+        out = self.fc(out.last_hidden_state[:, 0])
+        out = out.softmax(dim=1)
+        return out
+
+
+model = Model()
+
+# 微调设置
+# 解冻encoder最后两层，池化层，输出层参数
+unfreeze_3layers = ['layer.9','layer.10', 'layer.11', 'bert.pooler', 'out.','fc.1','fc.2','fc.3','fc.4']
+unfreeze_2layers = ['layer.10', 'layer.11', 'bert.pooler', 'out.','fc.1','fc.2','fc.3','fc.4']
+unfreeze_1layers = ['layer.11', 'bert.pooler', 'out.','fc.1','fc.2','fc.3','fc.4']
+
+# 查看bert参数
+# for name, param in model.named_parameters():
+#     print(name, param.size())
+# print("*" * 30)
+# print('\n')
+
+# # unfreeze
+# for name, param in model.named_parameters():
+#     # param.requires_grad = False
+#     for ele in unfreeze_3layers:
+#         if ele in name:
+#             param.requires_grad = True
+#             break
+# 验证一下
+for name, param in model.named_parameters():
+    if param.requires_grad:
+        print(name, param.size())
+
+
+
+# 移动到cuda
+model.to(device)
+
+# 定义数据集
+class Dataset(torch.utils.data.Dataset):
+    def __init__(self, split):
+        if split == 'train':
+            self.dataset = load_dataset(path='csv',
+                                        data_files='./data/training_set.csv',
+                                        split='train')
+        elif split == 'test':
+            self.dataset = load_dataset(path='csv',
+                                        data_files='./data/testing_set.csv',
+                                        split='train')
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, i):
+        text = self.dataset[i]['text']
+        label = self.dataset[i]['label']
+
+        return text, label
+
+
+# 加载字典和分词工具
+token = BertTokenizer.from_pretrained(model_path)
+
+
+def collate_fn(data):
+    sents0 = [i[0] for i in data]
+    labels0 = [i[1] for i in data]
+
+    # type standardlize
+    sents = [str(item) for item in sents0]
+    # Map string labels to numerical labels
+    label_map = {"安全": 1, "不良": 0}
+    labels = [label_map[l] for l in labels0]
+
+    # 编码
+    data = token.batch_encode_plus(batch_text_or_text_pairs=sents,
+                                   truncation=True,
+                                   padding='max_length',
+                                   max_length=500,
+                                   return_tensors='pt',
+                                   return_length=True)
+
+    # input_ids:编码之后的数字
+    # attention_mask:是补零的位置是0,其他位置是1
+    input_ids = data['input_ids'].to(device)
+    attention_mask = data['attention_mask'].to(device)
+    token_type_ids = data['token_type_ids'].to(device)
+    labels = torch.LongTensor(labels).to(device)
+
+    # print(data['length'], data['length'].max())
+
+    return input_ids, attention_mask, token_type_ids, labels
+
+
+# 数据加载器
+loader = torch.utils.data.DataLoader(dataset=Dataset('train'),
+                                     batch_size=16,
+                                     collate_fn=collate_fn,
+                                     shuffle=True,
+                                     drop_last=True)
+
+
+
+# test
+def test(set_name,batch_num):
+    model.eval()
+    total_labels = []
+    total_out = []
+
+    loader_test = torch.utils.data.DataLoader(dataset=Dataset(set_name),
+                                              batch_size=16,
+                                              collate_fn=collate_fn,
+                                              shuffle=True,
+                                              drop_last=True)
+
+    for i, (input_ids, attention_mask, token_type_ids,
+            labels) in enumerate(loader_test):
+        total_labels += labels
+        if i % 10 == 0:
+            print(i)
+        with torch.no_grad():
+            out = model(input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        token_type_ids=token_type_ids)
+
+        out = out.argmax(dim=1)
+        total_out += out
+
+        if i == batch_num:
+            break
+
+    # print(len(total_labels))
+    # print(len(total_out))
+
+    # list to tensor,then to cpu to use sklearn
+    labels_tensor = torch.tensor(total_labels)
+    outs_tensor = torch.tensor(total_out)
+    labels_tensor_cpu = labels_tensor.to('cpu')
+    outs_tensor_cpu = outs_tensor.to('cpu')
+
+    accuracy = accuracy_score(labels_tensor_cpu, outs_tensor_cpu)
+    precision=precision_score(labels_tensor_cpu,outs_tensor_cpu)
+    # 计算二分类回归率
+    recall = recall_score(labels_tensor_cpu, outs_tensor_cpu,average='binary')
+    f1 = f1_score(labels_tensor_cpu, outs_tensor_cpu)
+
+    print("on ",set_name," set:")
+    print("accuracy=", round(accuracy, 3))
+    print("precision=",round(precision,3))
+    print("recall=", round(recall, 3))
+    print("f1 score=", round(f1, 3),"\n")
+    # print('test on training set accuracy =', round(correct / total, 4))
+
+
+
+# 训练
+optimizer = AdamW(model.parameters(), lr=LR,weight_decay=WD)
+criterion = torch.nn.CrossEntropyLoss()
+
+for e in range(epoch):
+    print("epoch=", e + 1)
+    model.train()
+    for i, (input_ids, attention_mask, token_type_ids,
+            labels) in enumerate(loader):
+        out = model(input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    token_type_ids=token_type_ids)
+        loss = criterion(out, labels)
+        loss.backward()
+        optimizer.step()
+        # 每批都需要梯度清零，否则计算的是累积梯度
+        optimizer.zero_grad()
+        if i % 20 == 0:
+            out = out.argmax(dim=1)
+            accuracy = (out == labels).sum().item() / len(labels)
+            print(i+1, "loss=",round(loss.item(),3), "acc=",round(accuracy,3))
+    if e > 0 and ((e + 1) % epoch_num_between_tests == 0 or e + 1 >= start1B1):
+        test('train',100)
+        test('test',100)
+        if e + 1 >= start1B1:
+            end_time = time.time()  # 再次获取当前时间戳
+            elapsed_time = end_time - start_time  # 计算经过的时间
+            print(f"Elapsed time: {round(elapsed_time/60,2)} mins")
+            user_call = input("input s to stop,else to continue\n")
+            if user_call == 's':
+                break
+
+
+# 测试,用更多数据
+
+save_model_or_not=input("save model(s) or not\n")
+if save_model_or_not != 's':
+    sys.exit()
+
+model_number = input("model number=(number_layer)\n")
+# save model
+save_path = "./models/2_classify_model_" + model_number + "layer.pth"
+dict_save_path = "./models/2_classify_model_dict.pth"+model_number
+# bert_save_path = "./model/bert-finetuned"
+# 现在把bert放进model中那直接保存model即可
+torch.save(model.state_dict(),dict_save_path)
+# torch.save(model, save_path)
